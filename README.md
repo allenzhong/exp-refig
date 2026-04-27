@@ -1,7 +1,7 @@
 # Offline Figma Raw JSON
 
 Small Node CLI for converting a local `.fig` export to raw parsed JSON using
-`@grida/refig`, without calling the Figma API.
+`kiwi-schema`, without calling the Figma API.
 
 ## Install
 
@@ -14,7 +14,8 @@ npm install
 ```sh
 npm run convert -- ./design.fig --out ./raw.json
 npm run convert -- ./design.fig --node "1:23" --out ./node.json
-npm run convert -- ./design.fig --path pages.0.rootNodes.0
+npm run convert -- ./design.fig --path document.nodeChanges.0
+npm run convert -- ./design.fig --node "1:23" --path children.0
 npm run convert -- ./design.fig --tokens --out ./tokens.json
 npm run convert -- ./design.fig --node "1:23" --tokens --out ./node-tokens.json
 ```
@@ -25,7 +26,8 @@ Options:
 - `--node <id>` writes the raw node subtree for a Figma node ID, including its
   children.
 - `--path <path>` writes a raw value by dot path, for example
-  `pages.0.rootNodes.0`. It cannot be combined with `--node`.
+  `document.nodeChanges.0`. When combined with `--node`, the path is resolved
+  from the extracted node subtree.
 - `--tokens` extracts a best-effort token summary from the selected raw scope.
 - `--minify` writes compact JSON. The default is pretty-printed JSON.
 - `--help` prints CLI help.
@@ -53,12 +55,14 @@ Or to any raw path:
 
 ```sh
 npm run convert -- ./design.fig --path pages.0 --tokens
+npm run convert -- ./design.fig --node "1:23" --path children.0 --tokens
 ```
 
 ## Notes
 
-This CLI relies on `@grida/refig` to parse the `.fig` file, then serializes the
-internal parsed `.fig` document object. It does not output Grida scene JSON.
+This CLI directly decodes the `.fig` Kiwi archive and outputs the low-level
+`NODE_CHANGES` document shape, including `__meta`, `metadata`, `document`, and
+`document.blobs` when present. It does not output Grida scene JSON.
 
 The tool is offline-only: it reads `.fig` files from disk, does not accept Figma
 tokens, and does not fetch REST API file data or images.

@@ -3,24 +3,33 @@
 import { access, mkdir, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
-import { FigmaDocument } from "@grida/refig";
+import { readFileSync } from "node:fs";
+import { inflateSync, unzipSync } from "fflate";
+import { decompress } from "fzstd";
+import { compileSchema, decodeBinarySchema } from "kiwi-schema";
 
-type RefigResolvedScene = {
-  sceneJson: string;
-  images?: Record<string, Uint8Array>;
-  imageRefsUsed?: string[];
-};
+const FIG_KIWI_PRELUDE = "fig-kiwi";
+const FIGJAM_KIWI_PRELUDE = "fig-jam.";
+const FIGDECK_KIWI_PRELUDE = "fig-deck";
 
-type RefigRawRuntimeDocument = {
-  _resolve(rootNodeId?: string): RefigResolvedScene;
-  _figFile?: RawObject;
-};
+const ZIP_SIGNATURE = [80, 75, 3, 4];
+const ZSTD_SIGNATURE = [40, 181, 47, 253];
 
-type FigmaDocumentConstructorWithFile = typeof FigmaDocument & {
-  fromFile(filePath: string): FigmaDocument;
-};
+type FigmaFileType = "DESIGN" | "FIGJAM" | "SLIDES";
 
 type RawObject = Record<string, unknown>;
+
+type ParsedFigmaArchive = {
+  __meta: {
+    fileType: FigmaFileType;
+    version: number;
+    parsedAt: string;
+    isZipContainer: boolean;
+    embeddedImages: string[];
+  };
+  metadata: unknown;
+  document: RawObject;
+};
 
 type CliOptions = {
   input?: string;
@@ -58,7 +67,7 @@ const helpText = `Usage:
 Options:
   --out <path>   Write JSON to this file instead of stdout.
   --node <id>    Write the raw node subtree for this Figma node ID.
-  --path <path>  Write a raw value by dot path, e.g. pages.0.rootNodes.0.
+  --path <path>  Write a raw value by dot path, e.g. document.nodeChanges.0.
   --tokens       Extract a token summary from the selected raw scope.
   --minify       Write compact JSON. Defaults to pretty JSON.
   -h, --help     Show this help message.
@@ -66,7 +75,7 @@ Options:
 Examples:
   npm run convert -- ./design.fig --out ./raw.json
   npm run convert -- ./design.fig --node "1:23" --out ./node.json
-  npm run convert -- ./design.fig --path pages.0.rootNodes.0
+  npm run convert -- ./design.fig --path document.nodeChanges.0
   npm run convert -- ./design.fig --tokens --out ./tokens.json
   npm run convert -- ./design.fig --node "1:23" --tokens --out ./node-tokens.json
 `;
@@ -81,10 +90,6 @@ async function main(argv: string[]): Promise<void> {
 
   if (!options.input) {
     throw new CliError("Missing required input .fig path.\n\n" + helpText);
-  }
-
-  if (options.node && options.path) {
-    throw new CliError("--node cannot be combined with --path.");
   }
 
   assertFigExtension(options.input);
@@ -183,21 +188,175 @@ async function assertReadableFile(filePath: string): Promise<void> {
 
 function loadRawFigDocument(filePath: string): RawObject {
   try {
-    const loader = FigmaDocument as FigmaDocumentConstructorWithFile;
-    const document = loader.fromFile(filePath) as unknown as RefigRawRuntimeDocument;
-
-    if (!document._figFile) {
-      document._resolve();
-    }
-
-    if (!document._figFile) {
-      throw new Error("parsed .fig document was not available");
-    }
-
-    return document._figFile;
+    return parseFigmaArchive(readFileSync(filePath));
   } catch (error) {
     throw new CliError(`Failed to load raw .fig JSON: ${messageFrom(error)}`);
   }
+}
+
+function parseFigmaArchive(fileBytes: Uint8Array): ParsedFigmaArchive {
+  const { archiveBytes, zipFiles } = unwrapZipContainer(fileBytes);
+  const { header, files } = parseKiwiArchive(archiveBytes);
+  const [schemaFile, dataFile] = files;
+
+  if (!schemaFile || !dataFile) {
+    throw new Error("Figma archive did not contain schema and data files");
+  }
+
+  const fileSchema = decodeBinarySchema(inflateSync(schemaFile));
+  const compiledSchema = compileSchema(fileSchema) as {
+    decodeMessage(data: Uint8Array): RawObject;
+  };
+  const dataBytes = hasSignature(dataFile, ZSTD_SIGNATURE)
+    ? decompress(dataFile)
+    : inflateSync(dataFile);
+  const message = compiledSchema.decodeMessage(dataBytes);
+  const { metadata, ...document } = message;
+
+  return {
+    __meta: {
+      fileType: fileTypeFromPrelude(header.prelude),
+      version: header.version,
+      parsedAt: new Date().toISOString(),
+      isZipContainer: zipFiles !== undefined,
+      embeddedImages: embeddedImagesFromZip(zipFiles),
+    },
+    metadata: metadataFromZip(zipFiles) ?? metadata ?? null,
+    document,
+  };
+}
+
+function unwrapZipContainer(fileBytes: Uint8Array): {
+  archiveBytes: Uint8Array;
+  zipFiles?: Record<string, Uint8Array>;
+} {
+  if (!hasSignature(fileBytes, ZIP_SIGNATURE)) {
+    return { archiveBytes: fileBytes };
+  }
+
+  const zipFiles = unzipSync(fileBytes);
+  const mainFileName =
+    Object.keys(zipFiles).find((key) => isKiwiArchive(zipFiles[key])) ??
+    Object.keys(zipFiles).find((key) => key.endsWith(".fig") || key.endsWith(".deck"));
+
+  if (!mainFileName) {
+    throw new Error(
+      `ZIP archive found but no valid Figma file inside. Files: ${Object.keys(zipFiles).join(", ")}`,
+    );
+  }
+
+  return {
+    archiveBytes: zipFiles[mainFileName],
+    zipFiles,
+  };
+}
+
+function parseKiwiArchive(archiveBytes: Uint8Array): {
+  header: { prelude: string; version: number };
+  files: Uint8Array[];
+} {
+  let offset = 0;
+
+  const preludeBytes = readArchiveBytes(archiveBytes, offset, FIG_KIWI_PRELUDE.length);
+  offset += FIG_KIWI_PRELUDE.length;
+  const prelude = String.fromCharCode(...preludeBytes);
+
+  if (!isKiwiArchivePrelude(prelude)) {
+    throw new Error(`Unexpected Figma archive prelude: "${prelude}"`);
+  }
+
+  const version = readUint32LE(archiveBytes, offset);
+  offset += 4;
+
+  const files: Uint8Array[] = [];
+  while (offset + 4 < archiveBytes.length) {
+    const size = readUint32LE(archiveBytes, offset);
+    offset += 4;
+    files.push(readArchiveBytes(archiveBytes, offset, size));
+    offset += size;
+  }
+
+  return {
+    header: { prelude, version },
+    files,
+  };
+}
+
+function readArchiveBytes(bytes: Uint8Array, offset: number, length: number): Uint8Array {
+  if (offset + length > bytes.length) {
+    throw new Error(`Archive read past end of data at offset ${offset}`);
+  }
+  return bytes.slice(offset, offset + length);
+}
+
+function readUint32LE(bytes: Uint8Array, offset: number): number {
+  if (offset + 4 > bytes.length) {
+    throw new Error(`Archive uint32 read past end of data at offset ${offset}`);
+  }
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24)
+  ) >>> 0;
+}
+
+function hasSignature(bytes: Uint8Array, signature: number[]): boolean {
+  return bytes.length > signature.length && signature.every((byte, index) => bytes[index] === byte);
+}
+
+function isKiwiArchive(bytes: Uint8Array | undefined): boolean {
+  if (!bytes || bytes.length <= FIG_KIWI_PRELUDE.length) {
+    return false;
+  }
+
+  const prelude = String.fromCharCode(...bytes.slice(0, FIG_KIWI_PRELUDE.length));
+  return isKiwiArchivePrelude(prelude);
+}
+
+function isKiwiArchivePrelude(prelude: string): boolean {
+  return (
+    prelude === FIG_KIWI_PRELUDE ||
+    prelude === FIGJAM_KIWI_PRELUDE ||
+    prelude === FIGDECK_KIWI_PRELUDE
+  );
+}
+
+function fileTypeFromPrelude(prelude: string): FigmaFileType {
+  if (prelude === FIGJAM_KIWI_PRELUDE) {
+    return "FIGJAM";
+  }
+  if (prelude === FIGDECK_KIWI_PRELUDE) {
+    return "SLIDES";
+  }
+  return "DESIGN";
+}
+
+function embeddedImagesFromZip(zipFiles: Record<string, Uint8Array> | undefined): string[] {
+  if (!zipFiles) {
+    return [];
+  }
+
+  return Object.keys(zipFiles)
+    .filter((key) => isImagePath(key))
+    .sort();
+}
+
+function metadataFromZip(zipFiles: Record<string, Uint8Array> | undefined): unknown {
+  const metadataBytes = zipFiles?.["meta.json"];
+  if (!metadataBytes) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(new TextDecoder().decode(metadataBytes)) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function isImagePath(filePath: string): boolean {
+  return /\.(png|jpe?g|webp|gif|svg)$/i.test(filePath);
 }
 
 function selectRawScope(
@@ -205,9 +364,16 @@ function selectRawScope(
   options: CliOptions,
 ): { value: unknown; scope: TokenSummary["scope"] } {
   if (options.node) {
-    const node = findRawNode(rawDocument, options.node);
+    const node = findRawNodeSubtree(rawDocument, options.node);
     if (!node) {
       throw new CliError(`Raw node with id "${options.node}" was not found.`);
+    }
+
+    if (options.path) {
+      return {
+        value: selectByDotPath(node, options.path),
+        scope: { type: "path", nodeId: options.node, path: options.path },
+      };
     }
 
     return {
@@ -229,55 +395,88 @@ function selectRawScope(
   };
 }
 
-function findRawNode(value: unknown, nodeId: string): unknown {
-  const seen = new Set<unknown>();
-
-  function visit(current: unknown): unknown {
-    if (!current || typeof current !== "object") {
-      return undefined;
-    }
-
-    if (seen.has(current)) {
-      return undefined;
-    }
-    seen.add(current);
-
-    if (hasMatchingNodeId(current, nodeId)) {
-      return current;
-    }
-
-    if (Array.isArray(current)) {
-      for (const item of current) {
-        const found = visit(item);
-        if (found !== undefined) {
-          return found;
-        }
-      }
-      return undefined;
-    }
-
-    for (const child of Object.values(current)) {
-      const found = visit(child);
-      if (found !== undefined) {
-        return found;
-      }
-    }
-
+function findRawNodeSubtree(value: unknown, nodeId: string): unknown {
+  const nodeChanges = getNodeChanges(value);
+  if (!nodeChanges) {
     return undefined;
   }
 
-  return visit(value);
-}
+  const nodeByGuid = new Map<string, RawObject>();
+  const childrenByParentGuid = new Map<string, RawObject[]>();
 
-function hasMatchingNodeId(value: object, nodeId: string): boolean {
-  if (!("id" in value)) {
-    return false;
+  for (const node of nodeChanges) {
+    const guid = guidToString(node.guid);
+    if (!guid) {
+      continue;
+    }
+    nodeByGuid.set(guid, node);
+
+    const parentGuid = guidToString(asRawObject(node.parentIndex)?.guid);
+    if (parentGuid) {
+      const children = childrenByParentGuid.get(parentGuid) ?? [];
+      children.push(node);
+      childrenByParentGuid.set(parentGuid, children);
+    }
   }
 
-  const id = (value as { id?: unknown }).id;
-  return typeof id === "string" || typeof id === "number"
-    ? String(id) === nodeId
-    : false;
+  const root = nodeByGuid.get(nodeId);
+  if (!root) {
+    return undefined;
+  }
+
+  function buildSubtree(node: RawObject): RawObject {
+    const guid = guidToString(node.guid);
+    const children = guid ? childrenByParentGuid.get(guid) ?? [] : [];
+    const cloned = cloneJson(node);
+    if (children.length > 0) {
+      cloned.children = children
+        .sort(compareParentPosition)
+        .map((child) => buildSubtree(child));
+    }
+    return cloned;
+  }
+
+  return buildSubtree(root);
+}
+
+function getNodeChanges(value: unknown): RawObject[] | undefined {
+  const document = asRawObject(asRawObject(value)?.document);
+  const nodeChanges = document?.nodeChanges;
+  if (!Array.isArray(nodeChanges)) {
+    return undefined;
+  }
+  return nodeChanges.filter((node): node is RawObject => Boolean(node) && typeof node === "object");
+}
+
+function guidToString(guid: unknown): string | undefined {
+  const object = asRawObject(guid);
+  if (!object) {
+    return undefined;
+  }
+
+  const sessionID = object.sessionID;
+  const localID = object.localID;
+  if (typeof sessionID !== "number" || typeof localID !== "number") {
+    return undefined;
+  }
+
+  return `${sessionID}:${localID}`;
+}
+
+function compareParentPosition(left: RawObject, right: RawObject): number {
+  const leftPosition = String(asRawObject(left.parentIndex)?.position ?? "");
+  const rightPosition = String(asRawObject(right.parentIndex)?.position ?? "");
+  return leftPosition.localeCompare(rightPosition);
+}
+
+function asRawObject(value: unknown): RawObject | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as RawObject)
+    : undefined;
+}
+
+function cloneJson(value: unknown): RawObject {
+  return JSON.parse(JSON.stringify(value)) as RawObject;
 }
 
 function selectByDotPath(value: unknown, dotPath: string): unknown {
