@@ -1,0 +1,15 @@
+node_modules/
+dist/
+
+*.fig
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!.eslintrc.json
+!.prettierrc.json
+
+.DS_Store
+.env
+.env.*
+npm-debug.log*

@@ -1,0 +1,25 @@
+{
+  "name": "exp-refig",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "fig-to-json": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "preconvert": "npm run build",
+    "convert": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@grida/refig": "0.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
