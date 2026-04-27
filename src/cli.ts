@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { access, mkdir, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
-import path from "node:path";
-import { readFileSync } from "node:fs";
+import { access, mkdir, writeFile } from "fs/promises";
+import { constants, readFileSync } from "fs";
+import path from "path";
+import process from "process";
 import { inflateSync, unzipSync } from "fflate";
 import { decompress } from "fzstd";
 import { compileSchema, decodeBinarySchema } from "kiwi-schema";
