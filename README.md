@@ -12,9 +12,10 @@ npm install
 ## Usage
 
 ```sh
-npm run convert -- ./design.fig --out ./raw.json
+npm run convert -- ./design.fig --out ./document.json --meta-out ./meta.json
+npm run convert -- ./design.fig --meta --out ./meta.json
 npm run convert -- ./design.fig --node "1:23" --out ./node.json
-npm run convert -- ./design.fig --path document.nodeChanges.0
+npm run convert -- ./design.fig --path nodeChanges.0
 npm run convert -- ./design.fig --node "1:23" --path children.0
 npm run convert -- ./design.fig --tokens --out ./tokens.json
 npm run convert -- ./design.fig --node "1:23" --tokens --out ./node-tokens.json
@@ -22,12 +23,16 @@ npm run convert -- ./design.fig --node "1:23" --tokens --out ./node-tokens.json
 
 Options:
 
-- `--out <path>` writes JSON to a file. Without it, JSON is written to stdout.
+- `--out <path>` writes document JSON to a file. Without it, JSON is written to
+  stdout.
+- `--meta` writes metadata JSON instead of document JSON.
+- `--meta-out <path>` writes metadata JSON to a separate file in the same run as
+  the document output.
 - `--node <id>` writes the raw node subtree for a Figma node ID, including its
   children.
 - `--path <path>` writes a raw value by dot path, for example
-  `document.nodeChanges.0`. When combined with `--node`, the path is resolved
-  from the extracted node subtree.
+  `nodeChanges.0`. When combined with `--node`, the path is resolved from the
+  extracted node subtree.
 - `--tokens` extracts a best-effort token summary from the selected raw scope.
 - `--minify` writes compact JSON. The default is pretty-printed JSON.
 - `--help` prints CLI help.
@@ -54,15 +59,15 @@ npm run convert -- ./design.fig --node "1:23" --tokens
 Or to any raw path:
 
 ```sh
-npm run convert -- ./design.fig --path pages.0 --tokens
+npm run convert -- ./design.fig --path nodeChanges.0 --tokens
 npm run convert -- ./design.fig --node "1:23" --path children.0 --tokens
 ```
 
 ## Notes
 
 This CLI directly decodes the `.fig` Kiwi archive and outputs the low-level
-`NODE_CHANGES` document shape, including `__meta`, `metadata`, `document`, and
-`document.blobs` when present. It does not output Grida scene JSON.
+`NODE_CHANGES` document shape by default. Metadata is intentionally separate and
+can be written with `--meta` or `--meta-out`. It does not output Grida scene JSON.
 
 The tool is offline-only: it reads `.fig` files from disk, does not accept Figma
 tokens, and does not fetch REST API file data or images.

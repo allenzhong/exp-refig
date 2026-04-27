@@ -20,22 +20,24 @@ type FigmaFileType = "DESIGN" | "FIGJAM" | "SLIDES";
 type RawObject = Record<string, unknown>;
 
 type ParsedFigmaArchive = {
-  __meta: {
+  meta: {
     fileType: FigmaFileType;
     version: number;
     parsedAt: string;
     isZipContainer: boolean;
     embeddedImages: string[];
+    file?: unknown;
   };
-  metadata: unknown;
   document: RawObject;
 };
 
 type CliOptions = {
   input?: string;
   out?: string;
+  metaOut?: string;
   node?: string;
   path?: string;
+  meta: boolean;
   tokens: boolean;
   minify: boolean;
   help: boolean;
@@ -62,20 +64,23 @@ type TokenRecord = {
 };
 
 const helpText = `Usage:
-  fig-to-json <input.fig> [--out <path>] [--node <id>] [--path <path>] [--tokens] [--minify]
+  fig-to-json <input.fig> [--out <path>] [--meta-out <path>] [--node <id>] [--path <path>] [--meta] [--tokens] [--minify]
 
 Options:
-  --out <path>   Write JSON to this file instead of stdout.
-  --node <id>    Write the raw node subtree for this Figma node ID.
-  --path <path>  Write a raw value by dot path, e.g. document.nodeChanges.0.
-  --tokens       Extract a token summary from the selected raw scope.
-  --minify       Write compact JSON. Defaults to pretty JSON.
-  -h, --help     Show this help message.
+  --out <path>       Write document JSON to this file instead of stdout.
+  --meta-out <path>  Also write metadata JSON to this file.
+  --node <id>        Write the raw node subtree for this Figma node ID.
+  --path <path>      Write a raw value by dot path, e.g. nodeChanges.0.
+  --meta             Write metadata JSON instead of document JSON.
+  --tokens           Extract a token summary from the selected raw document scope.
+  --minify           Write compact JSON. Defaults to pretty JSON.
+  -h, --help         Show this help message.
 
 Examples:
-  npm run convert -- ./design.fig --out ./raw.json
+  npm run convert -- ./design.fig --out ./document.json --meta-out ./meta.json
+  npm run convert -- ./design.fig --meta --out ./meta.json
   npm run convert -- ./design.fig --node "1:23" --out ./node.json
-  npm run convert -- ./design.fig --path document.nodeChanges.0
+  npm run convert -- ./design.fig --path nodeChanges.0
   npm run convert -- ./design.fig --tokens --out ./tokens.json
   npm run convert -- ./design.fig --node "1:23" --tokens --out ./node-tokens.json
 `;
@@ -95,11 +100,22 @@ async function main(argv: string[]): Promise<void> {
   assertFigExtension(options.input);
   await assertReadableFile(options.input);
 
-  const rawDocument = loadRawFigDocument(options.input);
-  const selected = selectRawScope(rawDocument, options);
-  const value = options.tokens
-    ? extractTokens(selected.value, selected.scope)
-    : selected.value;
+  const archive = loadParsedFigmaArchive(options.input);
+
+  if (options.meta && (options.node || options.path || options.tokens)) {
+    throw new CliError("--meta cannot be combined with --node, --path, or --tokens.");
+  }
+
+  if (options.metaOut) {
+    await writeOutput(options.metaOut, formatJsonValue(archive.meta, options.minify));
+  }
+
+  const selected = selectRawScope(archive.document, options);
+  const value = options.meta
+    ? archive.meta
+    : options.tokens
+      ? extractTokens(selected.value, selected.scope)
+      : selected.value;
   const output = formatJsonValue(value, options.minify);
 
   if (options.out) {
@@ -113,6 +129,7 @@ async function main(argv: string[]): Promise<void> {
 
 function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
+    meta: false,
     tokens: false,
     minify: false,
     help: false,
@@ -136,11 +153,16 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === "--meta") {
+      options.meta = true;
+      continue;
+    }
+
     if (arg === "--raw") {
       continue;
     }
 
-    if (arg === "--out" || arg === "--node" || arg === "--path") {
+    if (arg === "--out" || arg === "--meta-out" || arg === "--node" || arg === "--path") {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) {
         throw new CliError(`Missing value for ${arg}.`);
@@ -148,6 +170,8 @@ function parseArgs(argv: string[]): CliOptions {
 
       if (arg === "--out") {
         options.out = value;
+      } else if (arg === "--meta-out") {
+        options.metaOut = value;
       } else if (arg === "--node") {
         options.node = value;
       } else {
@@ -186,7 +210,7 @@ async function assertReadableFile(filePath: string): Promise<void> {
   }
 }
 
-function loadRawFigDocument(filePath: string): RawObject {
+function loadParsedFigmaArchive(filePath: string): ParsedFigmaArchive {
   try {
     return parseFigmaArchive(readFileSync(filePath));
   } catch (error) {
@@ -211,18 +235,17 @@ function parseFigmaArchive(fileBytes: Uint8Array): ParsedFigmaArchive {
     ? decompress(dataFile)
     : inflateSync(dataFile);
   const message = compiledSchema.decodeMessage(dataBytes);
-  const { metadata, ...document } = message;
 
   return {
-    __meta: {
+    meta: {
       fileType: fileTypeFromPrelude(header.prelude),
       version: header.version,
       parsedAt: new Date().toISOString(),
       isZipContainer: zipFiles !== undefined,
       embeddedImages: embeddedImagesFromZip(zipFiles),
+      file: metadataFromZip(zipFiles) ?? message.metadata ?? null,
     },
-    metadata: metadataFromZip(zipFiles) ?? metadata ?? null,
-    document,
+    document: message,
   };
 }
 
