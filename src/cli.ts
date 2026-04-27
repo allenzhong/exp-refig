@@ -41,6 +41,7 @@ type CliOptions = {
   tokens: boolean;
   minify: boolean;
   help: boolean;
+  selfTestBigIntJson: boolean;
 };
 
 type TokenSummary = {
@@ -88,6 +89,11 @@ Examples:
 async function main(argv: string[]): Promise<void> {
   const options = parseArgs(argv);
 
+  if (options.selfTestBigIntJson) {
+    runBigIntJsonSelfTest();
+    return;
+  }
+
   if (options.help) {
     process.stdout.write(helpText);
     return;
@@ -133,6 +139,7 @@ function parseArgs(argv: string[]): CliOptions {
     tokens: false,
     minify: false,
     help: false,
+    selfTestBigIntJson: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -140,6 +147,11 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === "-h" || arg === "--help") {
       options.help = true;
+      continue;
+    }
+
+    if (arg === "--self-test-bigint-json") {
+      options.selfTestBigIntJson = true;
       continue;
     }
 
@@ -498,8 +510,12 @@ function asRawObject(value: unknown): RawObject | undefined {
     : undefined;
 }
 
+function jsonReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
 function cloneJson(value: unknown): RawObject {
-  return JSON.parse(JSON.stringify(value)) as RawObject;
+  return JSON.parse(JSON.stringify(value, jsonReplacer)) as RawObject;
 }
 
 function selectByDotPath(value: unknown, dotPath: string): unknown {
@@ -709,7 +725,7 @@ function stableKey(value: unknown): string {
 
 function stableStringify(value: unknown): string {
   if (!value || typeof value !== "object") {
-    return JSON.stringify(value);
+    return JSON.stringify(value, jsonReplacer);
   }
 
   if (Array.isArray(value)) {
@@ -725,7 +741,7 @@ function stableStringify(value: unknown): string {
 
 function formatJsonValue(value: unknown, minify: boolean): string {
   try {
-    const output = JSON.stringify(value, null, minify ? 0 : 2);
+    const output = JSON.stringify(value, jsonReplacer, minify ? 0 : 2);
     if (output === undefined) {
       throw new Error("value cannot be represented as JSON");
     }
@@ -733,6 +749,38 @@ function formatJsonValue(value: unknown, minify: boolean): string {
   } catch (error) {
     throw new CliError(`Failed to serialize JSON: ${messageFrom(error)}`);
   }
+}
+
+function runBigIntJsonSelfTest(): void {
+  const value = {
+    maxInt64: 9223372036854775807n,
+    nested: {
+      minInt64: -9223372036854775808n,
+    },
+  };
+
+  const prettyJson = formatJsonValue(value, false);
+  const minifiedJson = formatJsonValue(value, true);
+  const cloned = cloneJson(value);
+  const stableKey = stableStringify(value);
+
+  if (!prettyJson.includes('"maxInt64": "9223372036854775807"')) {
+    throw new CliError("BigInt JSON self-test failed: pretty output did not stringify BigInt.");
+  }
+
+  if (minifiedJson !== '{"maxInt64":"9223372036854775807","nested":{"minInt64":"-9223372036854775808"}}') {
+    throw new CliError("BigInt JSON self-test failed: minified output did not match.");
+  }
+
+  if (cloned.maxInt64 !== "9223372036854775807") {
+    throw new CliError("BigInt JSON self-test failed: cloned output did not stringify BigInt.");
+  }
+
+  if (!stableKey.includes('"maxInt64":"9223372036854775807"')) {
+    throw new CliError("BigInt JSON self-test failed: stable key did not stringify BigInt.");
+  }
+
+  process.stdout.write("BigInt JSON self-test passed.\n");
 }
 
 async function writeOutput(outPath: string, output: string): Promise<void> {
