@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { access, mkdir, writeFile } from "fs/promises";
-import { constants, readFileSync } from "fs";
+import { access, mkdir } from "fs/promises";
+import { constants, createWriteStream, readFileSync } from "fs";
 import path from "path";
 import process from "process";
 import { inflateSync, unzipSync } from "fflate";
@@ -40,9 +40,12 @@ type CliOptions = {
   meta: boolean;
   tokens: boolean;
   minify: boolean;
+  debug: boolean;
   help: boolean;
   selfTestBigIntJson: boolean;
 };
+
+type DebugLogger = (message: string) => void;
 
 type TokenSummary = {
   source: "fig";
@@ -75,6 +78,7 @@ Options:
   --meta             Write metadata JSON instead of document JSON.
   --tokens           Extract a token summary from the selected raw document scope.
   --minify           Write compact JSON. Defaults to pretty JSON.
+  --debug            Write parse/selection/serialization diagnostics to stderr.
   -h, --help         Show this help message.
 
 Examples:
@@ -88,9 +92,10 @@ Examples:
 
 async function main(argv: string[]): Promise<void> {
   const options = parseArgs(argv);
+  const debug = createDebugLogger(options.debug);
 
   if (options.selfTestBigIntJson) {
-    runBigIntJsonSelfTest();
+    await runBigIntJsonSelfTest();
     return;
   }
 
@@ -105,31 +110,36 @@ async function main(argv: string[]): Promise<void> {
 
   assertFigExtension(options.input);
   await assertReadableFile(options.input);
+  debug(`input=${options.input}`);
 
-  const archive = loadParsedFigmaArchive(options.input);
+  const archive = loadParsedFigmaArchive(options.input, debug);
 
   if (options.meta && (options.node || options.path || options.tokens)) {
     throw new CliError("--meta cannot be combined with --node, --path, or --tokens.");
   }
 
   if (options.metaOut) {
-    await writeOutput(options.metaOut, formatJsonValue(archive.meta, options.minify));
+    debug(`streaming meta output: ${summarizeValue(archive.meta)}`);
+    await writeJsonOutput(options.metaOut, archive.meta, options.minify, "metadata output", debug);
   }
 
   const selected = selectRawScope(archive.document, options);
+  debug(`selected scope=${scopeLabel(selected.scope)} value=${summarizeValue(selected.value)}`);
   const value = options.meta
     ? archive.meta
     : options.tokens
       ? extractTokens(selected.value, selected.scope)
       : selected.value;
-  const output = formatJsonValue(value, options.minify);
+  debug(`final output value=${summarizeValue(value)}`);
+  const outputMode = outputModeLabel(options);
+  debug(`streaming output mode=${outputMode}`);
 
   if (options.out) {
-    await writeOutput(options.out, output);
+    await writeJsonOutput(options.out, value, options.minify, `${outputMode} output`, debug);
     return;
   }
 
-  process.stdout.write(output);
+  await writeJsonToWritable(process.stdout, value, options.minify, `${outputMode} output`);
   process.stdout.write("\n");
 }
 
@@ -138,6 +148,7 @@ function parseArgs(argv: string[]): CliOptions {
     meta: false,
     tokens: false,
     minify: false,
+    debug: false,
     help: false,
     selfTestBigIntJson: false,
   };
@@ -157,6 +168,11 @@ function parseArgs(argv: string[]): CliOptions {
 
     if (arg === "--minify") {
       options.minify = true;
+      continue;
+    }
+
+    if (arg === "--debug") {
+      options.debug = true;
       continue;
     }
 
@@ -222,31 +238,44 @@ async function assertReadableFile(filePath: string): Promise<void> {
   }
 }
 
-function loadParsedFigmaArchive(filePath: string): ParsedFigmaArchive {
+function loadParsedFigmaArchive(filePath: string, debug: DebugLogger): ParsedFigmaArchive {
   try {
-    return parseFigmaArchive(readFileSync(filePath));
+    const fileBytes = readFileSync(filePath);
+    debug(`input bytes=${fileBytes.length}`);
+    return parseFigmaArchive(fileBytes, debug);
   } catch (error) {
     throw new CliError(`Failed to load raw .fig JSON: ${messageFrom(error)}`);
   }
 }
 
-function parseFigmaArchive(fileBytes: Uint8Array): ParsedFigmaArchive {
-  const { archiveBytes, zipFiles } = unwrapZipContainer(fileBytes);
+function parseFigmaArchive(fileBytes: Uint8Array, debug: DebugLogger): ParsedFigmaArchive {
+  const { archiveBytes, zipFiles } = unwrapZipContainer(fileBytes, debug);
+  debug(
+    `container=${zipFiles ? "zip" : "kiwi"} archive bytes=${archiveBytes.length}${
+      zipFiles ? ` zip entries=${Object.keys(zipFiles).length}` : ""
+    }`,
+  );
   const { header, files } = parseKiwiArchive(archiveBytes);
+  debug(`kiwi prelude=${header.prelude} version=${header.version} files=${files.length}`);
   const [schemaFile, dataFile] = files;
 
   if (!schemaFile || !dataFile) {
     throw new Error("Figma archive did not contain schema and data files");
   }
 
-  const fileSchema = decodeBinarySchema(inflateSync(schemaFile));
+  debug(`schema compressed bytes=${schemaFile.length} data compressed bytes=${dataFile.length}`);
+  const schemaBytes = inflateSync(schemaFile);
+  debug(`schema inflated bytes=${schemaBytes.length}`);
+  const fileSchema = decodeBinarySchema(schemaBytes);
   const compiledSchema = compileSchema(fileSchema) as {
     decodeMessage(data: Uint8Array): RawObject;
   };
   const dataBytes = hasSignature(dataFile, ZSTD_SIGNATURE)
     ? decompress(dataFile)
     : inflateSync(dataFile);
+  debug(`data inflated bytes=${dataBytes.length}`);
   const message = compiledSchema.decodeMessage(dataBytes);
+  debug(`decoded document=${summarizeValue(message)}`);
 
   return {
     meta: {
@@ -261,7 +290,10 @@ function parseFigmaArchive(fileBytes: Uint8Array): ParsedFigmaArchive {
   };
 }
 
-function unwrapZipContainer(fileBytes: Uint8Array): {
+function unwrapZipContainer(
+  fileBytes: Uint8Array,
+  debug: DebugLogger,
+): {
   archiveBytes: Uint8Array;
   zipFiles?: Record<string, Uint8Array>;
 } {
@@ -270,6 +302,12 @@ function unwrapZipContainer(fileBytes: Uint8Array): {
   }
 
   const zipFiles = unzipSync(fileBytes);
+  debug(
+    `zip entries: ${Object.entries(zipFiles)
+      .slice(0, 20)
+      .map(([name, bytes]) => `${name}=${bytes.length}`)
+      .join(", ")}${Object.keys(zipFiles).length > 20 ? ", ..." : ""}`,
+  );
   const mainFileName =
     Object.keys(zipFiles).find((key) => isKiwiArchive(zipFiles[key])) ??
     Object.keys(zipFiles).find((key) => key.endsWith(".fig") || key.endsWith(".deck"));
@@ -739,7 +777,7 @@ function stableStringify(value: unknown): string {
     .join(",")}}`;
 }
 
-function formatJsonValue(value: unknown, minify: boolean): string {
+function formatJsonValue(value: unknown, minify: boolean, context = "value"): string {
   try {
     const output = JSON.stringify(value, jsonReplacer, minify ? 0 : 2);
     if (output === undefined) {
@@ -747,11 +785,13 @@ function formatJsonValue(value: unknown, minify: boolean): string {
     }
     return output;
   } catch (error) {
-    throw new CliError(`Failed to serialize JSON: ${messageFrom(error)}`);
+    throw new CliError(
+      `Failed to serialize JSON for ${context}: ${messageFrom(error)}\n${summarizeValue(value)}`,
+    );
   }
 }
 
-function runBigIntJsonSelfTest(): void {
+async function runBigIntJsonSelfTest(): Promise<void> {
   const value = {
     maxInt64: 9223372036854775807n,
     nested: {
@@ -763,6 +803,7 @@ function runBigIntJsonSelfTest(): void {
   const minifiedJson = formatJsonValue(value, true);
   const cloned = cloneJson(value);
   const stableKey = stableStringify(value);
+  const streamedJson = await collectStreamedJson(value, true);
 
   if (!prettyJson.includes('"maxInt64": "9223372036854775807"')) {
     throw new CliError("BigInt JSON self-test failed: pretty output did not stringify BigInt.");
@@ -780,20 +821,484 @@ function runBigIntJsonSelfTest(): void {
     throw new CliError("BigInt JSON self-test failed: stable key did not stringify BigInt.");
   }
 
+  if (streamedJson !== minifiedJson) {
+    throw new CliError("BigInt JSON self-test failed: streamed output did not match.");
+  }
+
   process.stdout.write("BigInt JSON self-test passed.\n");
 }
 
-async function writeOutput(outPath: string, output: string): Promise<void> {
+async function writeJsonOutput(
+  outPath: string,
+  value: unknown,
+  minify: boolean,
+  context: string,
+  debug: DebugLogger,
+): Promise<void> {
   try {
     const outDir = path.dirname(outPath);
     if (outDir && outDir !== ".") {
       await mkdir(outDir, { recursive: true });
     }
 
-    await writeFile(outPath, output + "\n", "utf8");
+    debug(`streaming output path=${outPath}`);
+    await new Promise<void>((resolve, reject) => {
+      const stream = createWriteStream(outPath, { encoding: "utf8" });
+      stream.on("finish", resolve);
+      stream.on("error", (error: Error) => {
+        reject(new CliError(`Failed to write output file "${outPath}": ${messageFrom(error)}`));
+      });
+
+      writeJsonToWritable(stream, value, minify, context)
+        .then(() => {
+          stream.write("\n");
+          stream.end();
+        })
+        .catch((error: unknown) => {
+          stream.destroy();
+          reject(error);
+        });
+    });
+    debug(`streamed output path=${outPath}`);
   } catch (error) {
     throw new CliError(`Failed to write output file "${outPath}": ${messageFrom(error)}`);
   }
+}
+
+async function writeJsonToWritable(
+  stream: { write(chunk: string): void },
+  value: unknown,
+  minify: boolean,
+  context = "value",
+): Promise<void> {
+  const indent = minify ? "" : "  ";
+  const chunkSize = 65_536;
+  let buffer = "";
+  const seen = new Set<object>();
+
+  function flush(): void {
+    if (buffer) {
+      stream.write(buffer);
+      buffer = "";
+    }
+  }
+
+  function write(chunk: string): void {
+    buffer += chunk;
+    if (buffer.length >= chunkSize) {
+      flush();
+    }
+  }
+
+  function serialize(current: unknown, depth: number, inArray: boolean): void {
+    if (typeof current === "bigint") {
+      writeString(current.toString());
+      return;
+    }
+
+    if (current === null) {
+      write("null");
+      return;
+    }
+
+    switch (typeof current) {
+      case "string":
+        writeString(current);
+        return;
+      case "number":
+        write(Number.isFinite(current) ? String(current) : "null");
+        return;
+      case "boolean":
+        write(current ? "true" : "false");
+        return;
+      case "undefined":
+      case "function":
+      case "symbol":
+        if (inArray) {
+          write("null");
+          return;
+        }
+        throw new Error("value cannot be represented as JSON");
+      case "object":
+        break;
+      default:
+        throw new Error(`unsupported JSON value type: ${typeof current}`);
+    }
+
+    const object = current as object;
+    if (seen.has(object)) {
+      throw new Error("Converting circular structure to JSON");
+    }
+    seen.add(object);
+
+    try {
+      if (Array.isArray(current)) {
+        serializeArray(current, depth);
+        return;
+      }
+
+      serializeObject(current as RawObject, depth);
+    } finally {
+      seen.delete(object);
+    }
+  }
+
+  function serializeArray(values: unknown[], depth: number): void {
+    if (values.length === 0) {
+      write("[]");
+      return;
+    }
+
+    const childIndent = indent ? `\n${indent.repeat(depth + 1)}` : "";
+    const closingIndent = indent ? `\n${indent.repeat(depth)}` : "";
+    write("[");
+
+    for (let index = 0; index < values.length; index += 1) {
+      if (index > 0) {
+        write(",");
+      }
+      if (indent) {
+        write(childIndent);
+      }
+      serialize(values[index], depth + 1, true);
+    }
+
+    if (indent) {
+      write(closingIndent);
+    }
+    write("]");
+  }
+
+  function serializeObject(object: RawObject, depth: number): void {
+    const keys = Object.keys(object).filter((key) => isJsonObjectProperty(object[key]));
+    if (keys.length === 0) {
+      write("{}");
+      return;
+    }
+
+    const childIndent = indent ? `\n${indent.repeat(depth + 1)}` : "";
+    const closingIndent = indent ? `\n${indent.repeat(depth)}` : "";
+    write("{");
+
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (index > 0) {
+        write(",");
+      }
+      if (indent) {
+        write(childIndent);
+      }
+      writeString(key);
+      write(indent ? ": " : ":");
+      serialize(object[key], depth + 1, false);
+    }
+
+    if (indent) {
+      write(closingIndent);
+    }
+    write("}");
+  }
+
+  function writeString(value: string): void {
+    const output = JSON.stringify(value);
+    if (output === undefined) {
+      throw new Error("value cannot be represented as JSON");
+    }
+    write(output);
+  }
+
+  try {
+    serialize(value, 0, false);
+    flush();
+  } catch (error) {
+    logJsonDiagnostics(value);
+    throw new CliError(
+      `Failed to stream JSON for ${context}: ${messageFrom(error)}\n${summarizeValue(value)}`,
+    );
+  }
+}
+
+function isJsonObjectProperty(value: unknown): boolean {
+  return value !== undefined && typeof value !== "function" && typeof value !== "symbol";
+}
+
+function estimateSize(value: unknown, depth = 0): number {
+  if (value === null || value === undefined) {
+    return 4;
+  }
+  if (typeof value === "boolean") {
+    return 5;
+  }
+  if (typeof value === "number") {
+    return 16;
+  }
+  if (typeof value === "bigint") {
+    return value.toString().length + 2;
+  }
+  if (typeof value === "string") {
+    return value.length + 2;
+  }
+  if (depth >= 4) {
+    return 8;
+  }
+  if (Array.isArray(value)) {
+    return 2 + value.reduce((sum, item) => sum + estimateSize(item, depth + 1) + 1, 0);
+  }
+  if (typeof value === "object") {
+    const object = value as RawObject;
+    return (
+      2 +
+      Object.entries(object).reduce(
+        (sum, [key, child]) => sum + key.length + 4 + estimateSize(child, depth + 1) + 1,
+        0,
+      )
+    );
+  }
+  return 8;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1_073_741_824) {
+    return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
+  }
+  if (bytes >= 1_048_576) {
+    return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  }
+  if (bytes >= 1_024) {
+    return `${(bytes / 1_024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+function logJsonDiagnostics(value: unknown): void {
+  process.stderr.write("[debug] JSON serialization diagnostics:\n");
+
+  if (value === null || value === undefined || typeof value !== "object") {
+    process.stderr.write(`  type: ${typeof value}, value: ${String(value)}\n`);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    const estimatedSize = estimateSize(value);
+    process.stderr.write(
+      `  type: array, length: ${value.length}, estimated size: ~${formatBytes(estimatedSize)}\n`,
+    );
+    return;
+  }
+
+  const object = value as RawObject;
+  const keys = Object.keys(object);
+  const totalEstimatedSize = estimateSize(object);
+  process.stderr.write(
+    `  type: object, top-level keys: ${keys.length}, estimated size: ~${formatBytes(totalEstimatedSize)}\n`,
+  );
+
+  for (const key of keys) {
+    const child = object[key];
+    const estimatedSize = estimateSize(child);
+    const typeSuffix = Array.isArray(child)
+      ? `array(${child.length})`
+      : child === null
+        ? "null"
+        : typeof child;
+    process.stderr.write(`  key "${key}": ${typeSuffix}, ~${formatBytes(estimatedSize)}\n`);
+  }
+}
+
+async function collectStreamedJson(value: unknown, minify: boolean): Promise<string> {
+  let output = "";
+  await writeJsonToWritable(
+    {
+      write(chunk: string): void {
+        output += chunk;
+      },
+    },
+    value,
+    minify,
+    "self-test output",
+  );
+  return output;
+}
+
+function createDebugLogger(enabled: boolean): DebugLogger {
+  return enabled
+    ? (message: string): void => {
+        process.stderr.write(`[fig-to-json debug] ${message}\n`);
+      }
+    : (): void => {};
+}
+
+function outputModeLabel(options: CliOptions): string {
+  if (options.meta) {
+    return "metadata";
+  }
+  if (options.tokens) {
+    return "token";
+  }
+  if (options.node) {
+    return options.path ? "node path" : "node";
+  }
+  if (options.path) {
+    return "path";
+  }
+  return "document";
+}
+
+function scopeLabel(scope: TokenSummary["scope"]): string {
+  const parts: string[] = [scope.type];
+  if (scope.nodeId) {
+    parts.push(`node=${scope.nodeId}`);
+  }
+  if (scope.path) {
+    parts.push(`path=${scope.path}`);
+  }
+  return parts.join(" ");
+}
+
+function summarizeValue(value: unknown): string {
+  const stats = collectValueStats(value);
+  return [
+    `summary type=${stats.rootType}`,
+    `arrays=${stats.arrays}`,
+    `objects=${stats.objects}`,
+    `properties=${stats.properties}`,
+    `strings=${stats.strings}`,
+    `maxStringLength=${stats.maxStringLength}`,
+    `bigints=${stats.bigints}`,
+    `numbers=${stats.numbers}`,
+    `booleans=${stats.booleans}`,
+    `nulls=${stats.nulls}`,
+    `undefined=${stats.undefinedValues}`,
+    `maxDepth=${stats.maxDepth}`,
+    `truncated=${stats.truncated}`,
+    stats.topKeys.length > 0 ? `topKeys=${stats.topKeys.join(",")}` : undefined,
+    stats.rootArrayLength !== undefined ? `rootArrayLength=${stats.rootArrayLength}` : undefined,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(" ");
+}
+
+type ValueStats = {
+  rootType: string;
+  rootArrayLength?: number;
+  arrays: number;
+  objects: number;
+  properties: number;
+  strings: number;
+  maxStringLength: number;
+  bigints: number;
+  numbers: number;
+  booleans: number;
+  nulls: number;
+  undefinedValues: number;
+  maxDepth: number;
+  truncated: boolean;
+  topKeys: string[];
+};
+
+function collectValueStats(value: unknown): ValueStats {
+  const maxVisits = 25_000;
+  const seen = new Set<object>();
+  const stats: ValueStats = {
+    rootType: valueTypeLabel(value),
+    rootArrayLength: Array.isArray(value) ? value.length : undefined,
+    arrays: 0,
+    objects: 0,
+    properties: 0,
+    strings: 0,
+    maxStringLength: 0,
+    bigints: 0,
+    numbers: 0,
+    booleans: 0,
+    nulls: 0,
+    undefinedValues: 0,
+    maxDepth: 0,
+    truncated: false,
+    topKeys: [],
+  };
+  const topKeyCounts = new Map<string, number>();
+  let visits = 0;
+
+  function visit(current: unknown, depth: number): void {
+    if (visits >= maxVisits) {
+      stats.truncated = true;
+      return;
+    }
+    visits += 1;
+    stats.maxDepth = Math.max(stats.maxDepth, depth);
+
+    if (current === null) {
+      stats.nulls += 1;
+      return;
+    }
+
+    switch (typeof current) {
+      case "string":
+        stats.strings += 1;
+        stats.maxStringLength = Math.max(stats.maxStringLength, current.length);
+        return;
+      case "bigint":
+        stats.bigints += 1;
+        return;
+      case "number":
+        stats.numbers += 1;
+        return;
+      case "boolean":
+        stats.booleans += 1;
+        return;
+      case "undefined":
+        stats.undefinedValues += 1;
+        return;
+      case "object":
+        break;
+      default:
+        return;
+    }
+
+    const object = current as object;
+    if (seen.has(object)) {
+      return;
+    }
+    seen.add(object);
+
+    if (Array.isArray(current)) {
+      stats.arrays += 1;
+      for (const item of current) {
+        visit(item, depth + 1);
+        if (stats.truncated) {
+          return;
+        }
+      }
+      return;
+    }
+
+    stats.objects += 1;
+    for (const [key, child] of Object.entries(current as RawObject)) {
+      stats.properties += 1;
+      topKeyCounts.set(key, (topKeyCounts.get(key) ?? 0) + 1);
+      visit(child, depth + 1);
+      if (stats.truncated) {
+        return;
+      }
+    }
+  }
+
+  visit(value, 0);
+  stats.topKeys = Array.from(topKeyCounts.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 8)
+    .map(([key, count]) => `${key}:${count}`);
+  return stats;
+}
+
+function valueTypeLabel(value: unknown): string {
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  if (value === null) {
+    return "null";
+  }
+  return typeof value;
 }
 
 function messageFrom(error: unknown): string {
